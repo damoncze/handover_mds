@@ -43,6 +43,32 @@ Ve flotile je 36× FG100F a 15× FG120G, takže scénář se bude opakovat.
 
 ---
 
+## 0a. Upřesnění operátora (31. 8. večer) — platí nad vším níže
+
+1. **Bootstrap VLAN v HQ vidí do internetu i do SD-WAN.** Nová FG by po installu navázala
+   tunely k hubům a začala propagovat prefixy Strečna do SD-WAN vedle živé staré. Ve FMG
+   samotném dvě zařízení s různými jmény vedle sebe **žít můžou** (device DB, variables,
+   package, skupiny); nesmí být zároveň **online s tunely**. Dvě cesty, rozhodnout:
+   - **(a) blok z bootstrap VLAN na huby** (193.179.216.17/.19 Balabenka, 108.143.161.177
+     Azure) na HQ FG, FGFM k FMG 193.179.246.243 povolit → install v HQ proběhne celý, tunely
+     se nenaváží, na depu naskočí. Jednorázová změna v HQ, pokryje všech 36 výměn. Doporučeno.
+   - **(b) install až po cutoveru**: v HQ jen stage (device DB + package + skupiny), Install
+     Wizard z kanceláře, až nová FG běží na depu a stará je smazaná. Technik pořád jen mění
+     box, ale mezi zapnutím a installem má depo jen `Spoke_init`.
+2. **Strečno mění i switche a zapojení** → pre-stage `managed-switch`/`wtp` se **nedělá**.
+   Na ostatních lokalitách (jen box) chce operátor **report SN** AP a switchů (jméno, serial,
+   model, port/VLAN souhrn) do `out/<slug>/`, a do FMG si je dohází ručně po smazání starého
+   boxu. Automatický zápis wtp/managed-switch je mimo rozsah.
+3. **Fortilink membery zadá operátor jako vstup scénáře** (např. `port15,port16`), nic se
+   neodvozuje ani nekopíruje.
+4. **Package clone + úprava interfaců udělá operátor ručně** v GUI podle checklistu (§5),
+   scénář jen ověří, že package existuje a má scope na nové jméno.
+5. **PSK wifi jsou stejné** u tunelového i bridged VAP, mění se jen typ interface → parita se
+   neověřuje. PSK tunelu `Strecno` zůstává k dohledání.
+6. Smazání starého boxu z FMG = až po cutoveru; teprve pak operátor dohází switche/AP.
+
+---
+
 ## 1. Jak shuttle modeluje site a FG (ověřeno v kódu)
 
 | věc | kde | důsledek pro swap |
@@ -287,11 +313,12 @@ Nic z toho není v NetBoxu ani v shuttle. Stejný vzor má 8 dalších SK sitů 
 | ZTP promote nového jména | `site_init.yml` | beze změny |
 | variables | `site_provision.yml` | beze změny; předtím **kopie všech mapovaných OLD→NEW** (nový malý krok) |
 | interface config | `test_interface_config.yml` | beze změny (HA gate, port10, sec, lan16, wifi) |
-| package | ruční GUI | clone `securityconsole/package/clone` + scope na nový device + přepis interfaců (nový krok, nebo ruční s checklistem) |
+| package | ruční GUI | **zůstává ruční** (rozhodnutí 0a.4): clone + scope na nové jméno + přepis interfaců podle checklistu §5; scénář jen assertne, že package se scope na nové jméno existuje |
 | device groupy + SD-WAN template | ruční krok 7 | `dvmdb/adom/SDWAN/group/<g>/object member` add (nový, nebo ruční) |
 | site-specifika (VPN, routes, dochazka, address map, policy) | nic | kopie device-level objektů OLD→NEW s náhradou interface (`wan1→port1`) — nový krok |
-| wtp pre-stage | `aps_fortinet` čte/zapisuje `/pm/config/device/<dev>/vdom/root/wireless-controller/wtp` | zapsat 12 wtp podle serialu se jmény z NB a **bridged profilem**; profily založit (klon) |
-| managed-switch pre-stage | `switches_fortilink` jen čte | zapsat 4 managed-switch podle serialu s porty ze starého + allowed-vlans na AP portech |
+| fortilink membery | nic | **vstup scénáře** (`-e fortilink_members=port15,port16`), zapsat do device DB nové FG (rozhodnutí 0a.3) |
+| AP + switche | `aps_fortinet` / `switches_fortilink` čtou CMDB starého | **jen report** `out/<slug>/swap_devices.md`: jméno, serial, model, profil, AP-port↔switch-port z NB kabelů, per-switch souhrn native/allowed VLAN (rozhodnutí 0a.2). Žádný zápis wtp/managed-switch. Na Strečně se ani report nepoužije (nové switche i zapojení) |
+| bridged WTP profily | nic | ruční: `FAP231F_strecno_B` (vzor Levoca), `FAPU231F_strecno_B` (nový pro platform 72); scénář vypíše, které chybí |
 | Zabbix | create/skip | rename hosta + přepis WAN maker (po flipu CF stačí re-run sync pro makra, rename je nový) |
 | install | `fortimanager_install` | beze změny |
 | enrich / verify | beze změny | verify: opravit očekávání os_version 24.04 |
@@ -301,24 +328,22 @@ Nic z toho není v NetBoxu ani v shuttle. Stejný vzor má 8 dalších SK sitů 
 
 ## 8. Ověřit před stavbou (nejde vyčíst z kódu)
 
-1. **Bootstrap VLAN 999 v HQ**: pustí nová FG během installu provoz na public IP hubů
-   (193.179.216.17/.19, 108.143.161.177)? Pokud ano, naváže IPsec+BGP se stejnými tunnel IP,
-   loopbackem a LAN prefixy jako živé Strečno → kolize na hubu. Musí propouštět jen FGFM k FMG
-   (193.179.246.243), nebo SD-WAN membery držet down do výměny. **Nejvyšší priorita.**
-2. **FMG a tentýž serial switche/AP ve dvou device DB zároveň** (`managed-switch`, `wtp`).
-   Device DB je text konfigurace, FortiSwitch Manager ale může protestovat. Test na LAB
-   zařízení (existují `Spoke_CZ-LAB-Denis`, `Spoke-TF-lab`).
-3. **Autorizace FortiSwitchů na nové FG**: pre-auth záznam podle serialu (`switch-controller
-   managed-switch`) vs. ruční authorize; `fortilink-neighbor-detect=1`, `auto-auth-extension-device=0`.
-4. **Zdroj fortilink memberů port15/16 a split=0** na 120G (cleanup script 120G? device
-   settings?). Bez toho fortilink na nové 120G nevznikne správně.
-5. **PSK parita** tunel vs bridged VAP (Zebra, Packeta) a **PSK tunelu Strecno**.
-6. **Package clone přes API** (`exec securityconsole/package/clone`) a práva servisního účtu
-   `packeta-terraform` (deployment třída už jednou vrátila `-11 No permission`).
-7. Guest `packeta-guest` — rozhodnutí (zrušit / tunel / bridged).
-8. `dmz` 10.10.10.1/24 na STR — používá se?
-9. Nic na hubu neodkazuje na spoke **jménem** (BGP neighbor po tunnel IP; ověřit hub package/
+1. **Bootstrap VLAN 999 vidí do internetu i SD-WAN — potvrzeno operátorem.** Nová FG by po
+   installu v HQ navázala IPsec+BGP se stejnými tunnel IP, loopbackem a LAN prefixy jako živé
+   Strečno. **Rozhodnout mezi (a) blokem hub IP z bootstrap VLAN a (b) installem až po cutoveru**
+   (viz 0a.1). Bez toho se scénář nesmí pustit.
+2. **Autorizace FortiSwitchů na nové FG** po ručním doházení podle SN (`fortilink-neighbor-detect=1`,
+   `auto-auth-extension-device=0`) — ruční authorize v GUI, nebo pre-auth záznam. Pro Strečno
+   nerelevantní (nové switche), pro ostatní lokality ano.
+3. **`fortilink-split-interface` na 120G** (Bezdečín 0, Strečno 1): membery zadá operátor, ale
+   split musí scénář nastavit vědomě (CLI šablona `fortilink_split_interface_disable` existuje).
+4. **PSK tunelu `Strecno`** (dochádzka) — dohledat před přenosem VPN na port1. PSK wifi řešit
+   netřeba (0a.5).
+5. Guest `packeta-guest` — rozhodnutí (zrušit / tunel / bridged).
+6. `dmz` 10.10.10.1/24 na STR — používá se?
+7. Nic na hubu neodkazuje na spoke **jménem** (BGP neighbor po tunnel IP; ověřit hub package/
    CLI šablony `Hub_bgp_*`, `Hub_prefix-list_*`).
+8. Který FortiOS na novou 120G (flotila 120G je na 7.4.9, Strečno 100F na 7.4.11).
 
 ---
 
@@ -343,31 +368,44 @@ např. `PAC-SK-STR-2-FW` (nebo `-G-`). NB device: starý → `fw-1-100f.sk-depot
 6. `test_interface_config -e dry_run=false` s wifi výběrem z NB → fortilink IP, port10/monitoring,
    port12→sec, apmgmt, lan16 (stejná /24), packeta_mgmt, vl700/vl702 s DHCP.
 7. Site-specifika: IPsec Strecno (port1), static route, dochazka mapping, address mapping.
-8. Package: clone `Spoke_SK_STRECNO` → `Spoke_SK_STRECNO_2` (nebo přejmenování konvence),
-   scope `<NEW>`, přepis wifi/sec interfaců; device groupy `Spoke-dual` + `SDWAN_dual_prio_inet1`.
-9. Pre-stage wtp (12, jména z NB, profily `FAP231F_strecno_B` clone Levoca vzoru,
-   `FAPU231F_strecno_B` nový) a managed-switch (4, porty ze starého + allowed-vlans na AP portech).
-10. Install device settings + package; kontrola, že tunely k hubům **ne**běží (bod 8.1);
-    vypnout, zabalit.
+8. Package **ručně**: clone `Spoke_SK_STRECNO` → `Spoke_SK_STRECNO_2` (nebo konvence), scope
+   `<NEW>`, přepis wifi/sec interfaců podle §5; device groupy `Spoke-dual` +
+   `SDWAN_dual_prio_inet1`. Scénář: assert package se scope na `<NEW>` existuje, assert členství
+   ve skupinách, vypsat chybějící bridged WTP profily.
+9. Fortilink membery z vstupu (`-e fortilink_members=`) + split podle rozhodnutí 8.3 → device DB.
+   Report `out/<slug>/swap_devices.md` (AP + switche: jméno, SN, model, profil, porty) — na
+   Strečně informativní, na dalších lokalitách podklad pro ruční doházení do FMG.
+10. Install device settings + package **jen pokud platí 0a.1(a)** (blok hub IP z bootstrap VLAN);
+    jinak stage only a install až v kroku 12. Vypnout, zabalit.
 
-**B. Depo**: vypnout starou, vyměnit, přepojit (CPE→port1/port2, sw-1 uplinky→port15/16,
-proxy→port10, cam→port12), zapnout. Konec pro technika.
+**B. Depo**: vypnout starou, vyměnit, přepojit (CPE→port1/port2, uplinky switchů→fortilink
+membery, proxy→port10, cam→port12; na Strečně i nové switche a zapojení), zapnout. Konec pro
+technika.
 
 **C. Kancelář po cutoveru**
-11. NB: statusy, přesun IP port10 + kabelů (WAN, fortilink, proxy) na nový device.
-12. Zabbix: rename `PAC-SK-STR-FW → <NEW>`, makra WAN.CIR/IF.MATCHES na port1/port2.
-13. Kontrola adopce switchů a AP; `site_enrich` (AP jména už sedí), `verify_site`.
-14. FMG: smazat starý device + starý package, až nový prokazatelně běží.
+11. FMG: smazat starý device (uvolní SN switchů/AP), pak ručně dohází switche a AP podle
+    reportu z kroku 9 (mimo Strečno), authorize.
+12. Pokud 0a.1(b): Install Wizard device settings + package na `<NEW>`.
+13. NB: statusy (starý `decommissioning`, nový `active`), přesun IP port10 + kabelů (WAN,
+    fortilink, proxy) na nový device; na Strečně nové switche přes `site_enrich`.
+14. Zabbix: rename `PAC-SK-STR-FW → <NEW>`, makra WAN.CIR/IF.MATCHES na port1/port2.
+15. `site_enrich` (AP jména gap-fill nebo z NB), `verify_site`; smazat starý package.
 
 Přepínače přípravy: wifi bridged (ano), guest (rozhodnutí), LAN16 (ponechat adresy),
-loopback (ano, existuje).
+loopback (ano, existuje), fortilink membery (vstup), install v HQ (jen s blokem hubů).
 
 ---
 
 ## 10. Rizika
 
-- Dvě FG se stejnými tunnel IP / loopback / prefixy online zároveň během installu v HQ (8.1).
-- AP přečíslování gap-fillem, když se wtp nepředstageují se jmény z NB.
+- Dvě FG se stejnými tunnel IP / loopback / prefixy online zároveň během installu v HQ —
+  potvrzeno, že bootstrap VLAN to umožňuje (0a.1); bez bloku hubů nebo odloženého installu se
+  scénář nepouští.
+- Na lokalitách „jen box": mezi smazáním starého a ručním doházením switchů/AP podle SN je okno,
+  kdy nová FG switche neautorizuje → depo bez LAN/wifi. Report SN musí být hotový před cutoverem
+  a doházení první věc po něm.
+- AP přečíslování gap-fillem při `site_enrich` na nové FG (wtp se nepředstageují) — buď jména
+  z NB, nebo přijmout nová čísla a nechat NB postsync přepsat.
 - Zebra klienti: PSK parita; nový subnet u Packeta SSID; DHCP rezervace/whitelisty na starých
   wifi subnetech 172.19.20–23.
 - Dochádzka: tunel na novém WAN portu + nový PSK entry u protistrany? (protistrana vidí stejnou
