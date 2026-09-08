@@ -55,6 +55,24 @@ Ve flotile je 36× FG100F a 15× FG120G, takže scénář se bude opakovat.
    - **(b) install až po cutoveru**: v HQ jen stage (device DB + package + skupiny), Install
      Wizard z kanceláře, až nová FG běží na depu a stará je smazaná. Technik pořád jen mění
      box, ale mezi zapnutím a installem má depo jen `Spoke_init`.
+   - **(c) staging s placeholder IP hubů — DOPORUČENO (ověřeno v šablonách 31. 8.):** veřejné
+     IP hubů vstupují do konfigurace spoke **jen** přes variables `h1_inet1_ip`, `h1_inet2_ip`,
+     `h2_inet1_ip`, `h2_inet2_ip` (`spoke_ipsec` → `remote-gw`, `Spoke_static_route` → host
+     routy). `spoke_bgp` má neighbory na tunnel IP 172.16.x (jen přes tunely), SD-WAN template
+     `Spoke-dual` odkazuje jen jména interfaců a health-checky na loopbacky hubů přes overlay.
+     Když scénář po `site_provision` přepíše na **novém** zařízení ty 4 proměnné na
+     TEST-NET adresy (192.0.2.1–4; specific-scope push, stará FG netknuta), install proběhne
+     celý (LAN, VLANy, DHCP, wifi, DNS forwarder, cam, loopback, SNMP, package), tunely se
+     **nikdy nenaváží**, BGP nevznikne, nic se do SD-WAN nepropaguje — ať je box doma, v HQ,
+     nebo kdekoli s internetem. FGFM k FMG jede po WAN normálně.
+     **Cutover:** box na depu naběhne s plnou lokální konfigurací (LAN/wifi/DHCP fungují,
+     internet přes `underlay` funguje, overlay ne) → z kanceláře `site_provision` (vrátí reálné
+     hub IP z `hub.yml`, Category A) + Install Wizard → tunely + BGP naskočí během minut.
+     Staré zařízení stačí smazat kdykoli potom (jiné jméno, kolize není).
+     Vedlejší efekty ve stagingu: SD-WAN health-checky červené, FAZ dostává logy z domova —
+     kosmetika. Hlídat: `verify_site` má po cutoveru assertnout, že hub vars = `hub.yml`, aby
+     placeholder nezůstal zapomenutý. Site-specifický tunel `Strecno` řešit stejně (placeholder
+     remote-gw, nebo přidat až při cutoveru). Blok (a) lze přidat jako pás navíc, nutný není.
 2. **Strečno mění i switche a zapojení** → pre-stage `managed-switch`/`wtp` se **nedělá**.
    Na ostatních lokalitách (jen box) chce operátor **report SN** AP a switchů (jméno, serial,
    model, port/VLAN souhrn) do `out/<slug>/`, a do FMG si je dohází ručně po smazání starého
