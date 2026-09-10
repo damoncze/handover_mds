@@ -466,8 +466,12 @@ Branch **`feat/site-swap`** v shuttle (GitHub, commit `c9b957d`, PR čeká). Vyc
   wlt_packetavd, `vlan` na switch portech je list, robustnost při chybějícím `data`).
 - Runbook `docs/SITE_SWAP.md`; otevřené body pro pilot v `CLAUDE.md` §8.0 (a)–(g).
 
-**Než se pustí na Strečno:** LAN 172.19.16.0/24 není v NB → `prepare` zastaví; řešení je
-`-e swap_import_lan=true` (přečte fsp/vlan `lan` mapu starého boxu a založí prefix + VLAN 16 +
-gateway v NB; `prefix_reconcile` lan_subnet záměrně neumí — 11. 9. opraveno v kódu i docs, původní
-odkaz na reconcile byl špatný). Dál PSK tunelu `Strecno`, rozhodnutí o guest SSID, bridged profil
-pro FAP-U231F, a první `precheck sk-depot-1` (read-only).
+**Než se pustí na Strečno (upřesnění 11. 9.):** operátor rozhodl, že se generický LAN
+172.19.16.0/24 ani legacy zebra 172.20.52.0/23 **nepřenáší** — LAN 16 i wifi se alokují nově
+z poolů jako u nové lokality (`swap_lan_mode=alloc`, `swap_wifi_mode=alloc`, výchozí; `prepare` se
+ptá na wifi sítě z katalogu, Strečno = `wlt_zebra wlt_packeta_zvo`). Důsledek: dochádzkový
+systém 172.19.16.251 se musí přeadresovat a FMG address mapping `Dochadzkovy system` (site_specific
+ho kopíruje se starou adresou) opravit po cutoveru. `prefix_reconcile` lan_subnet záměrně neumí —
+nepoužívat. Nová FG už je v ADOM root jako unauthorized → ZTP promote v `prepare` může rovnou.
+Dál PSK tunelu `Strecno`, rozhodnutí o guest SSID, bridged profil pro FAP-U231F, a první
+`precheck sk-depot-1` (read-only).
