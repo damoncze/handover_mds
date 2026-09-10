@@ -466,6 +466,8 @@ Branch **`feat/site-swap`** v shuttle (GitHub, commit `c9b957d`, PR čeká). Vyc
   wlt_packetavd, `vlan` na switch portech je list, robustnost při chybějícím `data`).
 - Runbook `docs/SITE_SWAP.md`; otevřené body pro pilot v `CLAUDE.md` §8.0 (a)–(g).
 
-**Než se pustí na Strečno:** import LAN 172.19.16.0/24 do NB (`run_reconcile_prefixes.sh
-sk-depot-1 -e apply=true`), PSK tunelu `Strecno`, rozhodnutí o guest SSID, bridged profil pro
-FAP-U231F, a první `precheck sk-depot-1` (read-only).
+**Než se pustí na Strečno:** LAN 172.19.16.0/24 není v NB → `prepare` zastaví; řešení je
+`-e swap_import_lan=true` (přečte fsp/vlan `lan` mapu starého boxu a založí prefix + VLAN 16 +
+gateway v NB; `prefix_reconcile` lan_subnet záměrně neumí — 11. 9. opraveno v kódu i docs, původní
+odkaz na reconcile byl špatný). Dál PSK tunelu `Strecno`, rozhodnutí o guest SSID, bridged profil
+pro FAP-U231F, a první `precheck sk-depot-1` (read-only).
