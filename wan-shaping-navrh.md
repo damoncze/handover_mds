@@ -387,26 +387,34 @@ Works API (`works.packeta.com`) i CDN (`cdn-packeta-works.azureedge.net`) jedou 
 AFD rozsah, takže klasifikace podle IP by pustila 40 GB/h updatů do nejvyšší priority.
 Klasifikovat jen podle FQDN; `afd_works_150.171.109.0/24` z `grp_works_api` vyhodit.
 
-### 5.3 Trnava rozebraná (8. 9. 19 h – 9. 9. 01 h, session > 50 MB, 600 řádků)
+### 5.3 Trnava rozebraná (opraveno 10. 9. odpoledne)
 
-| Provoz | Objem (kumulativně logované session, nadhodnoceno) | Zdroje | Hodiny |
-|---|---|---|---|
-| **tcp/8443 wan1 → port12 (kamery), dst 195.146.137.122, policy 104** | 165 GB | 7 externích IP: 213.81.225.94, 34.250.127.182 (AWS), 185.110.144.194, **213.81.177.50 (= PAC-SK-STR-FW Strečno)**, **213.81.132.242 (= PAC-SK-BRA-TRIB-FW)**, 185.122.55.131, 178.143.191.182 | 23 h, 00 h |
-| Microsoft.Azure.Blob.Storage (20.60.27.196 + `packetaworksblob`) z `wlt_zebra` | 56 GB | 24 + 14 skenerů | 23 h, 00 h |
-| Works CDN z `wlt_zebra` | 3,5 GB | 18 | 00 h |
-| SSL 184.104.206.14 z `wlt_packeta_zvo` | 5 GB | 1 | 23–00 h |
+**Původní verze této sekce tvrdila, že Trnavu saturuje export kamer (165 GB za 2 h). Bylo to
+špatně.** Traffic log FortiGate loguje dlouhé session každé 2 minuty s **kumulativními**
+čítači (`rcvdbyte`/`sentbyte`/`duration` rostou monotónně, ověřeno na session dlouhých
+146–658 h). Součet přes řádky proto nadhodnocuje o řády. Správně: objem z FortiView, nebo
+z traffic logu `max(rcvdbyte)` per `sessionid`.
 
-Trnava má tedy dvě příčiny: (a) Zebra full download běží v SK **v noci** (23–01 h), ne
-v poledne; (b) **export kamerových záznamů přes veřejnou IP** ven na 7 adres, z toho dvě
-jsou vlastní FortiGaty (Strečno, Bratislava Tribečská) – vnitrofiremní přenos jde přes
-internet a NAT místo overlay, a jeden cíl je AWS Irsko (34.250.127.182, pravděpodobně
-cloud NVR/VMS). To je upload a saturuje `wan1` odchozím směrem; Zabbix trigger hlídá
-jen inbound, takže to vidíme pouze nepřímo.
+Co v Trnavě skutečně je (FortiView top-destinations 24 h, 9.–10. 9.):
 
-Akce Trnava: (1) zjistit, kdo/co stahuje archiv kamer (policy 104, dst 195.146.137.122:8443/8001),
-zda jde o plánovaný export a zda musí jet v 23–00 h; (2) Strečno a BRA-TRIB
-mají jít přes overlay (BGP prefix kamerové sítě + policy), ne přes veřejnou IP;
-(3) kamerový export do třídy `bulk` na egress `wan1`.
+| Cíl | Objem/24 h | Co to je |
+|---|---|---|
+| 20.60.27.196 (Works Blob) | **76 GB** | Zebra full download DB, z `wlt_zebra`, **v noci 23–01 h** |
+| 150.171.109.53 (Azure Front Door) | **24 GB** | Works CDN / API |
+| 195.146.137.122 (vlastní VIP → port12) | 1,6 GB (0,95 GB ven) | kamerová VLAN, viz níž |
+| 213.81.154.76–82 | ~1,1–1,4 GB každý | SK cíle, nezkoumáno |
+
+Trnava má tedy **stejnou příčinu jako CZ depa**, jen posunutou do noci (SK skenery dělají
+full download 23–01 h, CZ v poledne). Řešení = stejný class shaping, single-WAN varianta
+(wan1 100M / wan2 50M podle NetBoxu, obě v zóně `underlay`).
+
+Kamerová VLAN (port12) pro úplnost: 192.168.57.50 je MikroTik (`18:fd:74:3f:c9:d6`) s VIP
+`trnava-vpn-koncentrator` (tcp/8443) a `trnava-nvr-8001`. Tunely k němu drží MikroTiky
+v kamerových VLAN Strečna (`dc:2c:6e:d3:42:52`), Triblaviny (`18:fd:74:3f:f6:94`), Nitry
+(`08:55:31:91:4b:12`), Zvolena (`dc:2c:6e:d3:41:9a`) a dalších SK dep mimo FMG, plus AWS
+34.250.127.182 na NVR. Session trvají týdny, přenášejí ~1 GB/den dohromady, symetricky.
+Je to řídicí/keepalive VPN, ne stream kamer. **Shaper nepotřebuje.** Jediná otázka je
+architektonická (VPN přes internet a NAT místo overlay), ne kapacitní.
 
 ### 5.4 Co dalšího z FMG mění návrh
 
@@ -635,15 +643,6 @@ config firewall shaping-policy
         set application 16009 40169 17405 17136
         set class-id 5
     next
-    edit 14
-        set name "shape-bulk-cam-export"
-        set srcintf "$(inet1_name)" "$(inet2_name)"
-        set dstintf "port12"
-        set srcaddr "all"
-        set dstaddr "all"
-        set service "ALL"
-        set class-id 5
-    next
     edit 15
         set name "shape-business-scanners"
         set srcintf "campus_link_sub" "wlt_zebra-ts" "wlt_zebra"
@@ -657,9 +656,7 @@ end
 ```
 
 Pořadí: bulk Blob/CDN (10) před Works API (11), protože oba resolvují do AFD; FQDN
-match to rozliší, IP by ne. Pravidlo 14 řeší Trnavu (kamerový export přes VIP): je to
-reverse směr (odpovědi kamer odcházejí egress WAN), class-id se aplikuje na celou session.
-17136 = HTTP.Segmented.Download (Trnava). Ostatní app-ID viz 2.1.
+match to rozliší, IP by ne. 17136 = HTTP.Segmented.Download (Trnava). Ostatní app-ID viz 2.1.
 
 **D. SD-WAN: bulk přes obě linky s preferencí inet2 + hold-down na `internet`.**
 
@@ -716,7 +713,6 @@ ještě padá. Pokud ano, zvednout `failtime`/`recoverytime` na 10 (5 s), ne pra
   cíl je z 176/týden (Rudná) na jednotky.
 - FAZ: event handler na `logid 0113022934`/`0113022923` s `out-of-sla` je alternativa,
   ale Zabbix už drží WAN CIR, tak to patří k němu.
-- Po nasazení sledovat i `outbandwidth` drop counter na `wan1` Trnavy (upload).
 
 ### 5.7 Postup nasazení (upřesnění k části 3)
 
@@ -730,7 +726,7 @@ ještě padá. Pokud ano, zvednout `failtime`/`recoverytime` na 10 (5 s), ne pra
    strop 95 %, ne 99–100 %), počet `out-of-sla` `underlay` za den (FAZ; před: 25–45/den),
    doba full downloadu jednoho skeneru (Works tým / traffic log session duration).
 3. Rollout CZ dual (ROUDNA, JIH, UNL, NEH), pak single-WAN depa jen s A–C bez pravidla 10.
-4. Trnava: nejdřív vyjasnit kamerový export (5.3), pak shaping.
+4. Trnava: stejný shaping, single-WAN varianta; noční okno 23–01 h.
 
 ### 5.8 Neověřeno / nedotaženo
 
@@ -740,7 +736,7 @@ ještě padá. Pokud ano, zvednout `failtime`/`recoverytime` na 10 (5 s), ne pra
   DB Rudné; předpoklad, že šablona je shodná pro celou flotilu, ověřit v FMG GUI.
 - Tabulka CIR pro celou flotilu (proměnné šablony): Zabbix MCP na tomto stroji není
   nakonfigurovaný, dodat z prvního stroje (`usermacro.get` WAN CIR makra) nebo z NetBoxu.
-- Objemy kamerového exportu Trnava jsou z kumulativně logovaných session (nadhodnoceno);
-  identita 7 externích IP ověřena jen pro 2 vlastní FGT (FMG `list_devices`).
+- Interim logy dlouhých session jsou kumulativní (viz 5.3) – platí i pro čísla v 1.3
+  z traffic logu (35 GB/30 min Rudná); FortiView agregace v 1.3 jsou správné.
 - Filtr `appid==` v FAZ `query_logs` vrací prázdno (tichý fail) – aplikace identifikovat
   přes `app`/`hostname` v řádcích, ne přes appid.
