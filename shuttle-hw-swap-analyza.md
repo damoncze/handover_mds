@@ -439,3 +439,33 @@ loopback (ano, existuje), fortilink membery (vstup), install v HQ (jen s blokem 
   interface, variables, packages, policy, VPN, routes, šablony).
 - `verify_sk-depot-1.log`, `verify_cz-depot-28.log` tamtéž.
 - Zabbix host ids: STR 13580, BEZ 13587.
+
+---
+
+## 12. Stav 10. 9. 2026 — kód napsaný, živě neběžel
+
+Branch **`feat/site-swap`** v shuttle (GitHub, commit `c9b957d`, PR čeká). Vychází z §0a
+(varianta **c**: nové FMG jméno + TEST-NET placeholder v `h1/h2_inet1/2_ip`).
+
+- `playbooks/site_swap.yml` — `-e phase=precheck|prepare|cutover`, dry-run default,
+  `-e swap_apply=true` zapisuje. `bin/run_site_swap.sh precheck|prepare|cutover <slug>`
+  řídí vstupy, ZTP promote, cleanup pauzu a dry-run → confirm → apply. Menu **S**.
+- `roles/site_swap/`: `snapshot` (JSON do `out/backups/`), `fmg_checks` (package se scope
+  na nové jméno, device groupy, bridged WTP profily — hlídá, nezapisuje), `nb_normalize`
+  (ha_position, retag wifi prefixů, port10 IP + kabel; chybějící `lan_subnet` **zastaví**),
+  `nb_replace_fw` (starý fw-1 → `fw-1-<model>`, nový staged, Site CF flip), `copy_vars`
+  (old→new, Category M přežije), `hub_placeholders` (placeholder/restore), `site_specific`
+  (ne-hubové IPsec s náhradou `wan1→port1`, routy < seq 800, normalized intf a address
+  mapy), `report` (`out/<slug>/swap_devices.md` pro ruční doházení AP/switchů), `nb_cutover`
+  (statusy, přesun IP/kabelů podle mapy, FMG `port1` → NB `port 1`).
+- Mimo swap: `netbox_site_lookup` staged > active + `nb_wifi_ssids`; `zabbix_host_sync
+  tasks_from=rename`; `verify_site` os_version 24.04 + hub-placeholder guard.
+- Ověření: syntax-check v kontejneru, YAML, bash -n, menu 70 sloupců, **harness 38 Jinja
+  kontrol** proti fixturám ze Strečna (`~/tmp-claude/test_swap_jinja.py` ve WSL) — odhalil
+  5 chyb (phase1name je list, mapování device u rout, substring kolize wlt_packeta/
+  wlt_packetavd, `vlan` na switch portech je list, robustnost při chybějícím `data`).
+- Runbook `docs/SITE_SWAP.md`; otevřené body pro pilot v `CLAUDE.md` §8.0 (a)–(g).
+
+**Než se pustí na Strečno:** import LAN 172.19.16.0/24 do NB (`run_reconcile_prefixes.sh
+sk-depot-1 -e apply=true`), PSK tunelu `Strecno`, rozhodnutí o guest SSID, bridged profil pro
+FAP-U231F, a první `precheck sk-depot-1` (read-only).
