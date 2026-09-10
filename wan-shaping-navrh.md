@@ -328,3 +328,419 @@ depo a i po shapingu bude linka mezi 12. a 13. hodinou plná, jen řízeně.
   `firewall shaper`; z FAZ logu je ale jasné, že na WAN provoz se žádný shaper
   neaplikuje.
 - Trnava (PAC-SK-TRN-FW) není rozebraná.
+
+---
+
+## 5. Pokračování 10. 9. (druhý stroj): ověření přes FAZ/FMG a úpravy návrhu
+
+Zdroje: FAZ event log `subtype=sdwan` 3.–10. 9., FAZ traffic log a FortiView
+(Rudná 7. 9. 00–01 h, Trnava 8. 9. 19 h – 9. 9. 01 h), FMG device DB PAC-CZ-RUD-FW
+(`get_device_sdwan`, `get_device_interface_config`, `get_device_sdwan_monitor`),
+FMG šablony (`list_sdwan_templates`, `list_cli_template_groups`), policy 157/173.
+
+### 5.1 Ověřeno: „flapuje vše okolo" = SD-WAN pravidlo `internet` přeskakuje inet1↔inet2
+
+Konfigurace health-checku `underlay` na Rudné (device DB, stejná šablona pro všechny spoky):
+
+| Parametr | Hodnota | Důsledek |
+|---|---|---|
+| server | 193.179.246.243, 213.29.0.1 (ICMP) | probe replies přicházejí inbound po saturované lince |
+| interval / failtime / recoverytime | 500 ms / 5 / 5 | out-of-SLA i návrat za **2,5 s** |
+| SLA 1 | latency 250 ms, jitter 50 ms, **loss 5 %** | ISP shaper při saturaci zahazuje >5 % → out-of-SLA |
+| update-static-route | enable | |
+| pravidlo `internet` (id 2) | mode **sla**, členové 3 (inet1), 4 (inet2), **hold-down-time 0** | při out-of-SLA se celý internet přepne na inet2, za 2,5 s po uklidnění zpět |
+
+Overlay health-checky `Hub1_Loopback` / `Hub2_Loopback` (172.16.32.1/.2 přes tunel) mají
+latency 300 / loss 20 %, proto padají méně, ale také padají (Jihlava 58×, Nehvizdy 89× za 7 dní).
+
+Počet událostí `Member status changed. Member out-of-sla` za 3.–10. 9. (FAZ event log,
+`query_logs`, řádky spočítány lokálně):
+
+| Depo | out-of-SLA celkem | z toho `underlay` | špičkové hodiny |
+|---|---|---|---|
+| PAC-CZ-RUD-FW | 176 | 173 | **00 h: 47**, 12 h: 36, 10 h: 14 |
+| PAC-CZ-JIH-FW | 188 | 130 | 14 h: 38, 05 h: 27, 03 h: 24 |
+| PAC-CZ-NEH-FW-1 (název ve FAZ) | 202 | 113 | **00 h: 60**, 13 h: 39, 14 h: 34 |
+| PAC-CZ-UNL-FW | 93 | 89 | 12 h: 20, 01 h: 12 |
+| PAC-CZ-ROUDNA-FW | 56 | 56 | 14 h: 9, 13 h: 8, 01 h: 8 |
+| PAC-SK-TRN-FW | 84 | 78 | 06 h: 11, 01 h: 9 |
+
+Každé přepnutí = změna SNAT IP pro všechny internetové session (Works API, M365, Zabbix
+proxy → server přes overlay ne, ten jde jinou cestou, ale probe a ESP na inet1 trpí stejně).
+Rudná 7. 9. 00–01 h měla 35 z 195 CDN session na inet2 a 156 na inet1, tj. přepínalo to
+uprostřed stahování.
+
+**Závěr:** shaping sám nestačí, když pravidlo `internet` reaguje na 2,5 s výpadek SLA
+s nulovým hold-downem. Obojí je potřeba: FGT drží linku pod stropem ISP (žádný loss →
+SLA drží) a SD-WAN přestane reagovat na sekundové špičky.
+
+### 5.2 Nový nález: druhá vlna o půlnoci = Works CDN (update aplikace)
+
+Rudná 7. 9. 00:00–01:00: **Microsoft.Azure 40 GB / hod**, 100 % `cdn-packeta-works.azureedge.net`
+(Azure Front Door 150.171.109.99/.104/.105/.193/.194), policy 157 `campus_5g_sub-to-inet`,
+**98 zdrojů × shodných 178 MB** (172.20.8–11.x campus Zebra + 192.168.100.x `wlt_zasilzam`).
+To je noční distribuce balíčku aplikace, ne data. Vysvětluje půlnoční out-of-SLA špičky
+(Rudná 47, Nehvizdy 60) a `Microsoft.Azure` na 2. místě v FortiView.
+
+**Oprava návrhu z 2.1:** AFD prefix 150.171.109.0/24 NESMÍ být ve třídě `critical`.
+Works API (`works.packeta.com`) i CDN (`cdn-packeta-works.azureedge.net`) jedou přes tentýž
+AFD rozsah, takže klasifikace podle IP by pustila 40 GB/h updatů do nejvyšší priority.
+Klasifikovat jen podle FQDN; `afd_works_150.171.109.0/24` z `grp_works_api` vyhodit.
+
+### 5.3 Trnava rozebraná (8. 9. 19 h – 9. 9. 01 h, session > 50 MB, 600 řádků)
+
+| Provoz | Objem (kumulativně logované session, nadhodnoceno) | Zdroje | Hodiny |
+|---|---|---|---|
+| **tcp/8443 wan1 → port12 (kamery), dst 195.146.137.122, policy 104** | 165 GB | 7 externích IP: 213.81.225.94, 34.250.127.182 (AWS), 185.110.144.194, **213.81.177.50 (= PAC-SK-STR-FW Strečno)**, **213.81.132.242 (= PAC-SK-BRA-TRIB-FW)**, 185.122.55.131, 178.143.191.182 | 23 h, 00 h |
+| Microsoft.Azure.Blob.Storage (20.60.27.196 + `packetaworksblob`) z `wlt_zebra` | 56 GB | 24 + 14 skenerů | 23 h, 00 h |
+| Works CDN z `wlt_zebra` | 3,5 GB | 18 | 00 h |
+| SSL 184.104.206.14 z `wlt_packeta_zvo` | 5 GB | 1 | 23–00 h |
+
+Trnava má tedy dvě příčiny: (a) Zebra full download běží v SK **v noci** (23–01 h), ne
+v poledne; (b) **export kamerových záznamů přes veřejnou IP** ven na 7 adres, z toho dvě
+jsou vlastní FortiGaty (Strečno, Bratislava Tribečská) – vnitrofiremní přenos jde přes
+internet a NAT místo overlay, a jeden cíl je AWS Irsko (34.250.127.182, pravděpodobně
+cloud NVR/VMS). To je upload a saturuje `wan1` odchozím směrem; Zabbix trigger hlídá
+jen inbound, takže to vidíme pouze nepřímo.
+
+Akce Trnava: (1) zjistit, kdo/co stahuje archiv kamer (policy 104, dst 195.146.137.122:8443/8001),
+zda jde o plánovaný export a zda musí jet v 23–00 h; (2) Strečno a BRA-TRIB
+mají jít přes overlay (BGP prefix kamerové sítě + policy), ne přes veřejnou IP;
+(3) kamerový export do třídy `bulk` na egress `wan1`.
+
+### 5.4 Co dalšího z FMG mění návrh
+
+- **inet1/inet2 jsou VLAN 10/11 na agregátu `fortilink`** (device DB Rudná; stejný vzor
+  ze šablon `Spoke_tunnel_interface`/`Spoke_cam_interface`). Interface shaping profile na
+  VLAN sub-interface FortiOS 7.4 umí, ale běží v CPU, ne v NP (NP6xlite na 100F/200F,
+  SoC na 120G). Při 200–300 Mb/s je to pro 200F/120G v pořádku, na pilotu sledovat
+  `get system performance status` a `diagnose netlink intf-class list inet1`.
+- `inbandwidth`/`outbandwidth`/`*-shaping-profile` na inet1, inet2 jsou v device DB
+  prázdné – potvrzeno, že shaping dnes není nikde.
+- Policy 157 `campus_5g_sub-to-inet`: srcintf `campus_link_sub`, dstintf zóna `underlay`,
+  utm-status enable, žádný shaper. Policy 173 `any-to-zasis`: per-ip shaper `zasis_secure`
+  na FQDN `zasilkovna.cz`, s WAN saturací nesouvisí. Aplikační jména ve FortiView jsou,
+  takže app-ctrl profil na policy je – přes MCP ale `application-list` nečitelný, ověřit v GUI.
+- Provisioning: SD-WAN šablony `Spoke-single` (skupina Spoke-single) a `Spoke-dual`
+  (skupina `SDWAN_dual_prio_inet1` + HKR-BREZ + NEH) + `Spoke-dual-inet2-inet1`
+  (`SDWAN_dual_prio_inet2`). CLI template group `Spoke_CLI_group` (18 šablon, proměnné
+  `inet1_name`, `inet2_name`, `inet1_GN`…). Shaping = nová CLI šablona `Spoke_wan_shaping`
+  přidaná do `Spoke_CLI_group` (+ `_fox+packeta`, `_cam_252`, `_CZ-PHA-PRUM`), SD-WAN
+  úpravy do obou Spoke-* SD-WAN šablon. Obsah SD-WAN šablon přes MCP nejde číst
+  (vrací jen hlavičku), prahy beru z device DB Rudné.
+- Hub IP pro local-in klasifikaci: Balabenka 193.179.216.17, Azure 108.143.161.177
+  (FMG `list_devices`). ADVPN shortcuty (hub1_inet1_0…3) mají jako peer další spoky
+  (62.84.151.182, 62.77.90.217, 213.81.181.69) – ESP od nich pokrýt službou, ne IP.
+
+### 5.5 Upravený návrh (nahrazuje část 2.1 a 2.2)
+
+**A. Třídy a dva profily místo jednoho.** Primární linka má bulk strop 50 %, sekundární
+(u dual dep prázdná) 90 %. Pořadí garancí zůstává.
+
+```
+config firewall shaping-profile
+    edit "wan_primary"
+        set type policing
+        set default-class-id 4
+        config shaping-entries
+            edit 1
+                set class-id 2
+                set priority top
+                set guaranteed-bandwidth-percentage 20
+                set maximum-bandwidth-percentage 100
+            next
+            edit 2
+                set class-id 3
+                set priority high
+                set guaranteed-bandwidth-percentage 30
+                set maximum-bandwidth-percentage 100
+            next
+            edit 3
+                set class-id 4
+                set priority medium
+                set guaranteed-bandwidth-percentage 20
+                set maximum-bandwidth-percentage 100
+            next
+            edit 4
+                set class-id 5
+                set priority low
+                set guaranteed-bandwidth-percentage 10
+                set maximum-bandwidth-percentage 50
+            next
+        end
+    next
+    edit "wan_secondary"
+        set type policing
+        set default-class-id 4
+        config shaping-entries
+            edit 1
+                set class-id 2
+                set priority top
+                set guaranteed-bandwidth-percentage 10
+                set maximum-bandwidth-percentage 100
+            next
+            edit 2
+                set class-id 3
+                set priority high
+                set guaranteed-bandwidth-percentage 10
+                set maximum-bandwidth-percentage 100
+            next
+            edit 3
+                set class-id 4
+                set priority medium
+                set guaranteed-bandwidth-percentage 10
+                set maximum-bandwidth-percentage 100
+            next
+            edit 4
+                set class-id 5
+                set priority low
+                set guaranteed-bandwidth-percentage 20
+                set maximum-bandwidth-percentage 90
+            next
+        end
+    next
+end
+config system interface
+    edit "$(inet1_name)"
+        set inbandwidth $(inet1_cir_kbps_95)
+        set outbandwidth $(inet1_up_kbps_95)
+        set ingress-shaping-profile "wan_primary"
+        set egress-shaping-profile "wan_primary"
+    next
+    edit "$(inet2_name)"
+        set inbandwidth $(inet2_cir_kbps_95)
+        set outbandwidth $(inet2_up_kbps_95)
+        set ingress-shaping-profile "wan_secondary"
+        set egress-shaping-profile "wan_secondary"
+    next
+end
+```
+
+Ingress profil musí být `type policing` (queuing FortiOS na ingress nepodporuje).
+Upload CIR (`*_up_kbps`) je u asymetrických linek jiný než download – doplnit jako
+nové proměnné šablony, zdroj Zabbix WAN CIR makra / NetBox.
+
+**B. Objekty: jen FQDN, žádný AFD prefix.**
+
+```
+config firewall address
+    edit "works_blob_fqdn"
+        set type fqdn
+        set fqdn "packetaworksblob.blob.core.windows.net"
+    next
+    edit "works_cdn_fqdn"
+        set type fqdn
+        set fqdn "cdn-packeta-works.azureedge.net"
+    next
+    edit "works_api_fqdn"
+        set type fqdn
+        set fqdn "works.packeta.com"
+    next
+    edit "hub_balabenka_pub"
+        set subnet 193.179.216.17 255.255.255.255
+    next
+    edit "hub_azure_pub"
+        set subnet 108.143.161.177 255.255.255.255
+    next
+    edit "sdwan_hc_underlay_servers"
+        set type iprange
+        set start-ip 193.179.246.243
+        set end-ip 193.179.246.243
+    next
+    edit "sdwan_hc_underlay_server2"
+        set subnet 213.29.0.1 255.255.255.255
+    next
+end
+config firewall addrgrp
+    edit "grp_works_bulk"
+        set member "works_blob_fqdn" "works_cdn_fqdn"
+    next
+    edit "grp_sdwan_hubs"
+        set member "hub_balabenka_pub" "hub_azure_pub"
+    next
+    edit "grp_sdwan_hc"
+        set member "sdwan_hc_underlay_servers" "sdwan_hc_underlay_server2"
+    next
+end
+```
+
+**C. Shaping policy: local-in pro ESP/IKE a SLA probe, pak forwarding.** FortiOS 7.4
+umí `set traffic-type local-in|local-out` (Traffic shaping extensions 7.4.0). Tím se
+ESP od hubů a ICMP odpovědi health-checku dostanou do třídy 2 místo default třídy.
+Syntaxi ověřit na pilotu (`show firewall shaping-policy`), na 7.4.9 by měla být.
+
+```
+config firewall shaping-policy
+    edit 1
+        set name "li-critical-overlay-esp"
+        set traffic-type local-in
+        set srcintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ESP" "IKE"
+        set class-id 2
+    next
+    edit 2
+        set name "li-critical-sdwan-probe"
+        set traffic-type local-in
+        set srcintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "grp_sdwan_hc" "grp_sdwan_hubs"
+        set dstaddr "all"
+        set service "PING" "ALL_ICMP"
+        set class-id 2
+    next
+    edit 3
+        set name "lo-critical-overlay-esp"
+        set traffic-type local-out
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ESP" "IKE" "PING"
+        set class-id 2
+    next
+    edit 10
+        set name "shape-bulk-works-blob-cdn"
+        set srcintf "any"
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "grp_works_bulk"
+        set service "ALL"
+        set class-id 5
+    next
+    edit 11
+        set name "shape-critical-works-api"
+        set srcintf "any"
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "works_api_fqdn"
+        set service "HTTPS"
+        set class-id 2
+    next
+    edit 12
+        set name "shape-critical-infra"
+        set srcintf "monitoring" "loopback_snmp" "apmgmt" "srvmgmt" "packeta_mgmt"
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ALL"
+        set class-id 2
+    next
+    edit 13
+        set name "shape-bulk-updates"
+        set srcintf "any"
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ALL"
+        set application 16009 40169 17405 17136
+        set class-id 5
+    next
+    edit 14
+        set name "shape-bulk-cam-export"
+        set srcintf "$(inet1_name)" "$(inet2_name)"
+        set dstintf "port12"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ALL"
+        set class-id 5
+    next
+    edit 15
+        set name "shape-business-scanners"
+        set srcintf "campus_link_sub" "wlt_zebra-ts" "wlt_zebra"
+        set dstintf "$(inet1_name)" "$(inet2_name)"
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ALL"
+        set class-id 3
+    next
+end
+```
+
+Pořadí: bulk Blob/CDN (10) před Works API (11), protože oba resolvují do AFD; FQDN
+match to rozliší, IP by ne. Pravidlo 14 řeší Trnavu (kamerový export přes VIP): je to
+reverse směr (odpovědi kamer odcházejí egress WAN), class-id se aplikuje na celou session.
+17136 = HTTP.Segmented.Download (Trnava). Ostatní app-ID viz 2.1.
+
+**D. SD-WAN: bulk přes obě linky s preferencí inet2 + hold-down na `internet`.**
+
+```
+config system sdwan
+    config service
+        edit 10
+            set name "works_bulk"
+            set mode sla
+            set dst "grp_works_bulk"
+            set priority-members 4 3
+            set hold-down-time 120
+            config sla
+                edit "underlay"
+                    set id 1
+                next
+            end
+        next
+        edit 2
+            set hold-down-time 60
+        next
+    end
+end
+```
+
+`works_bulk` musí být nad `internet` (id 2). Varianta `mode load-balance` přes 4 a 3
+dá Rudné až ~185 Mb/s pro bulk (90 % ze 100M + 50 % ze 200M) a inet1 přesto nikdy
+nepřijde o polovinu kapacity; začít s `sla` + preferencí inet2, load-balance až podle
+doby full downloadu na pilotu. `hold-down-time 60` na `internet` zabrání přepnutí zpět
+dřív než za minutu po návratu do SLA; první přepnutí (fail) zůstává rychlé, což je správně.
+U single-WAN dep (`Spoke-single`) pravidlo 10 nepřidávat, jen hold-down.
+
+Health-check `underlay` neměnit hned; až po shapingu vyhodnotit, jestli loss 5 % / 2,5 s
+ještě padá. Pokud ano, zvednout `failtime`/`recoverytime` na 10 (5 s), ne prahy.
+
+**E. Works (aplikační příčina), doplněno o CDN a cache.**
+
+1. Noční update aplikace (178 MB × všechna zařízení depa ve stejné minutě po půlnoci) →
+   rozložit start (jitter 0–120 min), nebo řídit přes MDM (SOTI) staged rollout po depech.
+2. Denní full download DB (~400 MB) → totéž jako v 2.3; navíc: SK depa ho dělají v noci,
+   CZ v poledne. Ptát se, čím je čas daný (time zone? konfigurace per depo?) – pokud jde
+   nastavit, dát CZ depa také mimo provozní špičku.
+3. **Blob je per depo, ne per zařízení** (viz `depot:20` v `blob_urls` z 31. 8.). 140 skenerů
+   stahuje 140× stejný soubor. Lokální cache v depu (reverse proxy s cache, DNS override
+   přes FGT dns-database, který depa už používají pro `pl-blob-core-windows-net`) sníží
+   WAN objem na 1× za den. Rudná má lokální compute (VLAN `kubernet` 10.210.56.0/21).
+   Je to největší páka: shaping problém zmírní, cache ho odstraní.
+
+### 5.6 Monitoring doplněný o SD-WAN
+
+- Zabbix: SNMP `fgVWLHealthCheckLinkTable` (FORTINET-FORTIGATE-MIB, 7.4) → item
+  `sdwan.hc.state[underlay,inet1]` + trigger „SD-WAN member out-of-SLA > 3× za hodinu",
+  bez PagerDuty (pozor na akci 3, viz 2.4). To je přímý KPI pro efekt shapingu:
+  cíl je z 176/týden (Rudná) na jednotky.
+- FAZ: event handler na `logid 0113022934`/`0113022923` s `out-of-sla` je alternativa,
+  ale Zabbix už drží WAN CIR, tak to patří k němu.
+- Po nasazení sledovat i `outbandwidth` drop counter na `wan1` Trnavy (upload).
+
+### 5.7 Postup nasazení (upřesnění k části 3)
+
+1. Pilot Rudná: CLI šablona `Spoke_wan_shaping` s bloky A–C (proměnné
+   `inet1_cir_kbps_95=190000`, `inet1_up_kbps_95` dle upload CIR, `inet2_*=95000`),
+   SD-WAN blok D do šablony `Spoke-dual`. Nasadit po 15 h, kdy je linka na 10–50 %.
+   Ověřit: `diagnose firewall fqdn list` (Blob/CDN resolvují), `show firewall shaping-policy`
+   (traffic-type přijat), `diagnose netlink intf-class list inet1` (pakety v třídách 2/5),
+   CPU.
+2. Metriky pilotu 11.–12. 9.: Zabbix `wan.util.in[inet1]` v 00–01 h a 12–13 h (očekávání:
+   strop 95 %, ne 99–100 %), počet `out-of-sla` `underlay` za den (FAZ; před: 25–45/den),
+   doba full downloadu jednoho skeneru (Works tým / traffic log session duration).
+3. Rollout CZ dual (ROUDNA, JIH, UNL, NEH), pak single-WAN depa jen s A–C bez pravidla 10.
+4. Trnava: nejdřív vyjasnit kamerový export (5.3), pak shaping.
+
+### 5.8 Neověřeno / nedotaženo
+
+- Syntaxe `traffic-type local-in` na 7.4.9 a chování ingress profilu na VLAN sub-interface
+  (dokumentace Fortinet se z tohoto stroje nedala načíst, stránky jsou JS-only) → pilot.
+- Obsah SD-WAN šablon `Spoke-dual`/`Spoke-single` (MCP vrací jen hlavičku). Prahy jsou z device
+  DB Rudné; předpoklad, že šablona je shodná pro celou flotilu, ověřit v FMG GUI.
+- Tabulka CIR pro celou flotilu (proměnné šablony): Zabbix MCP na tomto stroji není
+  nakonfigurovaný, dodat z prvního stroje (`usermacro.get` WAN CIR makra) nebo z NetBoxu.
+- Objemy kamerového exportu Trnava jsou z kumulativně logovaných session (nadhodnoceno);
+  identita 7 externích IP ověřena jen pro 2 vlastní FGT (FMG `list_devices`).
+- Filtr `appid==` v FAZ `query_logs` vrací prázdno (tichý fail) – aplikace identifikovat
+  přes `app`/`hostname` v řádcích, ne přes appid.
